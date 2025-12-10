@@ -18,7 +18,11 @@ from preprocess_text import preprocess_news_data
 from sentiment_analysis import apply_sentiment_to_news
 from rolling_sentiment import compute_rolling_sentiment
 from create_labels import create_labels
-from train_model import train_model
+from train_model import (
+    train_all_models, predict_with_model, get_model_list, 
+    get_model_description, DEFAULT_MODEL, AVAILABLE_MODELS,
+    get_available_models_for_ticker, train_model
+)
 
 st.set_page_config(page_title="Stock Sentiment Predictor", page_icon="📈", layout="wide")
 
@@ -32,7 +36,7 @@ newsapi_configured = NEWS_API_KEY and NEWS_API_KEY != "your_newsapi_key_here" an
 if newsapi_configured:
     st.success("""
     ✅ **NewsAPI Configured!** You can now fetch up to 100 articles from the last 30 days.
-    Select your preferred historical period below (30-90 days recommended).
+    Select your preferred historical period below (7-30 days recommended).
     """)
 else:
     st.info("""
@@ -54,6 +58,24 @@ with st.sidebar:
     st.write("2. 📰 Collects news from multiple sources")
     st.write("3. 🧠 Analyzes sentiment using BERT")
     st.write("4. 🤖 Trains ML models for prediction")
+    st.markdown("---")
+    
+    # Model Selection Section
+    st.markdown("### 🤖 Model Selection")
+    selected_model = st.selectbox(
+        "Choose Prediction Model",
+        options=get_model_list(),
+        index=0,  # Gradient Boosting is first (default)
+        help="Select the ML model for predictions. Gradient Boosting is recommended."
+    )
+    
+    # Show model description
+    model_desc = get_model_description(selected_model)
+    if selected_model == DEFAULT_MODEL:
+        st.success(f"{model_desc}")
+    else:
+        st.info(f"{model_desc}")
+    
     st.markdown("---")
     
     # API Configuration Check
@@ -223,12 +245,22 @@ if ticker:
                 error_occurred = True
             
             if not error_occurred:
-                status_text.text("🤖 Training models...")
+                status_text.text("🤖 Training ALL models (one-time)...")
                 progress_bar.progress(80)
                 try:
-                    accuracies = train_model(ticker)
-                    if accuracies and len(accuracies) > 0:
-                        st.success(f"✅ Models trained successfully (Accuracies: {accuracies})")
+                    # Train ALL models at once - user can switch between them without re-fetching data
+                    model_results = train_all_models(ticker, horizons=[1, 7])
+                    if model_results and len(model_results) > 0:
+                        total_models = sum(len(models) for models in model_results.values())
+                        st.success(f"✅ {total_models} models trained successfully!")
+                        
+                        # Show which models were trained
+                        with st.expander("📊 Model Training Results", expanded=False):
+                            for horizon, models in model_results.items():
+                                st.markdown(f"**{horizon}-Day Horizon:**")
+                                for model_name, info in models.items():
+                                    marker = "🏆" if model_name == DEFAULT_MODEL else ""
+                                    st.write(f"  {marker} {model_name}: {info['accuracy']:.2%} accuracy")
                     else:
                         st.warning("⚠️ No models trained - check data requirements")
                 except Exception as e:
@@ -280,55 +312,60 @@ if ticker:
 
                 # Predictions
                 st.markdown("---")
-                st.subheader("🔮 Predictions")
+                st.subheader(f"🔮 Predictions using **{selected_model}**")
+                
+                # Add model switch info
+                if selected_model == DEFAULT_MODEL:
+                    st.caption("🏆 Using recommended model (best accuracy)")
+                else:
+                    st.caption(f"💡 Switch to **{DEFAULT_MODEL}** in sidebar for best results")
                 
                 horizons = [1, 7]  # Removed 30-day prediction
                 horizon_names = {"1": "Tomorrow", "7": "Next Week"}
                 
                 pred_cols = st.columns(2)  # Changed from 3 to 2 columns
                 for idx, h in enumerate(horizons):
-                    model_path = get_model_path(f"{ticker}_model_{h}d.pkl")
+                    # Use the new predict_with_model function
+                    pred, confidence, accuracy = predict_with_model(ticker, selected_model, h)
                     
-                    # Debug logging
-                    print(f"Checking for model: {model_path}, exists: {os.path.exists(model_path)}")
-                    
-                    if os.path.exists(model_path):
-                        try:
-                            import joblib
-                            model = joblib.load(model_path)
-                            print(f"✅ Model loaded for {h}-day")
-                            
-                            features_path = get_data_path(f"{ticker}_features_{h}d.csv")
-                            if not os.path.exists(features_path):
-                                with pred_cols[idx]:
-                                    st.warning(f"⚠️ {horizon_names.get(str(h), f'{h}-Day')}: No features found")
-                                print(f"❌ Features not found: {features_path}")
-                                continue
-                                
-                            features = pd.read_csv(features_path).iloc[-1:]
-                            if features.empty:
-                                with pred_cols[idx]:
-                                    st.warning(f"⚠️ {horizon_names.get(str(h), f'{h}-Day')}: Empty features")
-                                continue
-                                
-                            pred = model.predict(features)[0]
-                            proba = model.predict_proba(features)[0]
-                            
-                            direction = "📈 UP" if pred == 1 else "📉 DOWN"
-                            confidence = float(max(proba)) * 100
-                            
-                            with pred_cols[idx]:
-                                st.metric(
-                                    label=horizon_names.get(str(h), f"{h}-Day"),
-                                    value=direction,
-                                    delta=f"{confidence:.1f}% confidence"
-                                )
-                        except Exception as e:
-                            with pred_cols[idx]:
-                                st.warning(f"⚠️ {horizon_names.get(str(h), f'{h}-Day')}: Error - {str(e)[:50]}")
+                    if pred is not None:
+                        direction = "📈 UP" if pred == 1 else "📉 DOWN"
+                        
+                        with pred_cols[idx]:
+                            st.metric(
+                                label=horizon_names.get(str(h), f"{h}-Day"),
+                                value=direction,
+                                delta=f"{confidence:.1f}% confidence"
+                            )
+                            if accuracy:
+                                st.caption(f"Model accuracy: {accuracy:.1%}")
                     else:
                         with pred_cols[idx]:
                             st.info(f"ℹ️ {horizon_names.get(str(h), f'{h}-Day')}: Not available")
+                
+                # Show comparison with other models (expandable)
+                with st.expander("📊 Compare All Models", expanded=False):
+                    st.markdown("**Compare predictions across all trained models:**")
+                    
+                    for h in horizons:
+                        st.markdown(f"**{horizon_names.get(str(h), f'{h}-Day')} Prediction:**")
+                        
+                        comparison_data = []
+                        for model_name in get_model_list():
+                            pred, conf, acc = predict_with_model(ticker, model_name, h)
+                            if pred is not None:
+                                comparison_data.append({
+                                    'Model': f"{'🏆 ' if model_name == DEFAULT_MODEL else ''}{model_name}",
+                                    'Prediction': "📈 UP" if pred == 1 else "📉 DOWN",
+                                    'Confidence': f"{conf:.1f}%",
+                                    'Accuracy': f"{acc:.1%}" if acc else "N/A"
+                                })
+                        
+                        if comparison_data:
+                            df_comparison = pd.DataFrame(comparison_data)
+                            st.dataframe(df_comparison, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No models available for comparison")
 
                 # Display stats
                 st.markdown("---")
